@@ -56,4 +56,3 @@ MIT License
 
 ---
 
-Do you want me to rename the script to **`app.py`** in the README (instead of that long filename) so it looks cleaner and more professional?
