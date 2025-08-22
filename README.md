@@ -1,4 +1,4 @@
-#  Refurbished Phone Selling – Demo App
+#  Refurbished Phone Selling – App
 
 A Streamlit demo for managing refurbished phone inventory, computing platform-specific listing prices, and simulating marketplace listings.
 
