@@ -1,0 +1,507 @@
+from __future__ import annotations
+import os
+import io
+import re
+import json
+import math
+import time
+import hashlib
+import pandas as pd
+import streamlit as st
+from typing import Dict, Tuple, Optional, List
+
+# ------------------------------
+# Security & Auth (Mock)
+# ------------------------------
+
+def hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+
+DEFAULT_USER = os.environ.get("RPAPP_USER", "admin")
+DEFAULT_PASS = os.environ.get("RPAPP_PASS", "admin123")
+DEFAULT_PASS_HASH = hash_pw(DEFAULT_PASS)
+
+# Session bootstrap
+if "auth" not in st.session_state:
+    st.session_state.auth = {"logged_in": False, "user": None}
+if "inventory" not in st.session_state:
+    # DataFrame columns definition
+    st.session_state.inventory = pd.DataFrame(
+        columns=[
+            "id","brand","model","storage","color","condition","stock",
+            "base_price","tags","reserved_b2b","manual_price_X","manual_price_Y","manual_price_Z",
+            "listed_X","listed_Y","listed_Z"
+        ]
+    )
+if "log" not in st.session_state:
+    st.session_state.log = []  # list of dicts (timestamp, action, details)
+if "settings" not in st.session_state:
+    st.session_state.settings = {
+        "min_margin_flag_pct": 0.30,  # if markup over base exceeds 30%, flag unprofitable
+        "block_on_unprofitable": True,
+    }
+
+# Prevent XSS in text fields (naive sanitization for demo)
+SAFE_TEXT = re.compile(r"^[\w\s\-\+\./#,&()]*$")
+
+def sanitize_text(val: str) -> str:
+    if not isinstance(val, str):
+        return ""
+    v = val.strip()
+    if SAFE_TEXT.match(v):
+        return v
+    # Strip disallowed chars
+    return re.sub(r"[^\w\s\-\+\./#,&()]+", "", v)
+
+# ------------------------------
+# Fee & Condition Mapping Logic
+# ------------------------------
+
+# Platform fee models: given desired net (base_price), compute listing price L so that
+# L - (fee(L)) >= base_price. For percentage f and flat c: L = (base + c) / (1 - f)
+FEE_MODELS = {
+    "X": {"percent": 0.10, "fixed": 0.0},
+    "Y": {"percent": 0.08, "fixed": 2.0},
+    "Z": {"percent": 0.12, "fixed": 0.0},
+}
+
+# Internal conditions -> per-platform categories
+COND_MAP = {
+    "X": {"New": "New", "Good": "Good", "Scrap": "Scrap", "As New": "New", "Excellent": "New", "Usable": "Good"},
+    "Y": {"New": "3★ (Excellent)", "Excellent": "3★ (Excellent)", "As New": "3★ (Excellent)", "Good": "2★ (Good)", "Usable": "1★ (Usable)", "Scrap": None},
+    "Z": {"New": "New", "As New": "As New", "Excellent": "As New", "Good": "Good", "Usable": "Good", "Scrap": None},
+}
+
+ALL_INTERNAL_CONDS = ["New", "Excellent", "As New", "Good", "Usable", "Scrap"]
+
+
+def compute_listing_price(base_price: float, platform: str) -> Optional[float]:
+    if base_price is None:
+        return None
+    try:
+        base = float(base_price)
+    except Exception:
+        return None
+    if base <= 0:
+        return None
+    f = FEE_MODELS[platform]["percent"]
+    c = FEE_MODELS[platform]["fixed"]
+    denom = 1.0 - f
+    if denom <= 0:
+        return None
+    return round((base + c) / denom, 2)
+
+
+def price_profitability_flag(base_price: float, list_price: float) -> bool:
+    """Returns True if markup exceeds threshold and should be flagged as unprofitable."""
+    try:
+        base = float(base_price)
+        L = float(list_price)
+    except Exception:
+        return True
+    if base <= 0 or L <= 0:
+        return True
+    markup = (L - base) / max(base, 1e-9)
+    return markup > st.session_state.settings["min_margin_flag_pct"]
+
+
+def condition_supported(platform: str, internal_cond: str) -> Tuple[bool, Optional[str]]:
+    mapped = COND_MAP.get(platform, {}).get(internal_cond)
+    if mapped is None:
+        return False, None
+    return True, mapped
+
+# ------------------------------
+# Utilities
+# ------------------------------
+
+def log_event(action: str, details: dict):
+    st.session_state.log.append({
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "action": action,
+        "details": details,
+    })
+
+
+def df_coerce_types(df: pd.DataFrame) -> pd.DataFrame:
+    # Ensure required columns and types
+    for col in ["id","brand","model","storage","color","condition","stock","base_price","tags","reserved_b2b",
+                "manual_price_X","manual_price_Y","manual_price_Z","listed_X","listed_Y","listed_Z"]:
+        if col not in df.columns:
+            df[col] = None
+    # Coercions
+    df["id"] = df["id"].astype(str)
+    for c in ["brand","model","storage","color","condition","tags"]:
+        df[c] = df[c].astype(str).map(sanitize_text)
+    for c in ["stock"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+    for c in ["base_price","manual_price_X","manual_price_Y","manual_price_Z"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").round(2)
+    for c in ["reserved_b2b","listed_X","listed_Y","listed_Z"]:
+        df[c] = df[c].astype(str).str.lower().isin(["true","1","yes","y"])
+    return df
+
+
+def next_id() -> str:
+    existing = set(st.session_state.inventory["id"].tolist())
+    i = 1
+    while True:
+        cand = f"P{i:04d}"
+        if cand not in existing:
+            return cand
+        i += 1
+
+# ------------------------------
+# Authentication UI
+# ------------------------------
+
+st.set_page_config(page_title="Refurbished Phones – Demo", page_icon="📱", layout="wide")
+
+st.title(" Refurbished Phone Selling – Demo App")
+
+if not st.session_state.auth["logged_in"]:
+    with st.sidebar:
+        st.header("Login")
+        u = st.text_input("Username", value="", key="login_user")
+        p = st.text_input("Password", value="", type="password", key="login_pass")
+        if st.button("Sign In", use_container_width=True):
+            if sanitize_text(u) == DEFAULT_USER and hash_pw(p) == DEFAULT_PASS_HASH:
+                st.session_state.auth = {"logged_in": True, "user": u}
+                st.success("Logged in.")
+                log_event("login", {"user": u})
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
+    st.info("Use admin / admin123 (or set RPAPP_USER / RPAPP_PASS).")
+    st.stop()
+
+# ------------------------------
+# Sidebar – Settings & Bulk Ops
+# ------------------------------
+with st.sidebar:
+    st.subheader("Settings")
+    st.session_state.settings["min_margin_flag_pct"] = st.slider(
+        "Flag if markup exceeds (%)", min_value=5, max_value=80, value=int(st.session_state.settings["min_margin_flag_pct"]*100)
+    ) / 100.0
+    st.session_state.settings["block_on_unprofitable"] = st.checkbox(
+        "Block listing on 'unprofitable'", value=st.session_state.settings["block_on_unprofitable"]
+    )
+
+    st.markdown("---")
+    st.subheader("Bulk Upload / Download")
+
+    # Template download
+    template_df = pd.DataFrame([
+        {
+            "id": "",
+            "brand": "Apple",
+            "model": "iPhone 12",
+            "storage": "128GB",
+            "color": "Black",
+            "condition": "Good",
+            "stock": 5,
+            "base_price": 350.0,
+            "tags": "",
+            "reserved_b2b": False,
+            "manual_price_X": "",
+            "manual_price_Y": "",
+            "manual_price_Z": "",
+            "listed_X": False,
+            "listed_Y": False,
+            "listed_Z": False,
+        }
+    ])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        template_df.to_excel(writer, index=False, sheet_name="inventory")
+    st.download_button("Download XLSX Template", data=buf.getvalue(), file_name="inventory_template.xlsx")
+
+    uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv","xlsx"])
+    if uploaded is not None:
+        try:
+            if uploaded.name.endswith(".csv"):
+                dfu = pd.read_csv(uploaded)
+            else:
+                dfu = pd.read_excel(uploaded)
+            dfu = df_coerce_types(dfu)
+            # Auto-assign IDs for missing
+            dfu.loc[dfu["id"].eq("") | dfu["id"].isna(), "id"] = [next_id() for _ in range((dfu["id"].eq("") | dfu["id"].isna()).sum())]
+            st.session_state.inventory = pd.concat([st.session_state.inventory, dfu], ignore_index=True)
+            st.success(f"Imported {len(dfu)} records")
+            log_event("bulk_import", {"rows": len(dfu)})
+        except Exception as e:
+            st.error(f"Import failed: {e}")
+
+    if st.button("Export Inventory as CSV"):
+        csv = st.session_state.inventory.to_csv(index=False).encode("utf-8")
+        st.download_button("Download Now", data=csv, file_name="inventory_export.csv", mime="text/csv")
+
+# ------------------------------
+# Price Computation Helpers (vectorized for table view)
+# ------------------------------
+
+def compute_prices_row(row: pd.Series) -> Dict[str, Optional[float]]:
+    prices = {}
+    for P in ["X","Y","Z"]:
+        if pd.notna(row.get(f"manual_price_{P}")) and row.get(f"manual_price_{P}") > 0:
+            prices[P] = round(float(row[f"manual_price_{P}"]), 2)
+        else:
+            prices[P] = compute_listing_price(row.get("base_price"), P)
+    return prices
+
+# ------------------------------
+# Header – Controls
+# ------------------------------
+colA, colB, colC, colD = st.columns([2,2,2,1])
+with colA:
+    st.subheader("Inventory")
+with colB:
+    if st.button("Recompute All Prices"):
+        # No persistent change needed; compute on the fly. Log action.
+        log_event("recompute_prices", {"count": len(st.session_state.inventory)})
+        st.success("Prices will reflect latest settings/overrides below.")
+with colC:
+    if st.button("Clear All Listings (X/Y/Z)"):
+        if not st.session_state.inventory.empty:
+            for P in ["X","Y","Z"]:
+                st.session_state.inventory[f"listed_{P}"] = False
+            log_event("clear_listings", {})
+            st.success("Cleared.")
+with colD:
+    if st.button("Add Sample Data"):
+        sample = pd.DataFrame([
+            {"id": next_id(), "brand":"Apple","model":"iPhone 12","storage":"128GB","color":"Black","condition":"Good","stock":5,"base_price":350.0,"tags":"","reserved_b2b":False,"manual_price_X":None,"manual_price_Y":None,"manual_price_Z":None,"listed_X":False,"listed_Y":False,"listed_Z":False},
+            {"id": next_id(), "brand":"Samsung","model":"Galaxy S21","storage":"256GB","color":"Silver","condition":"As New","stock":3,"base_price":400.0,"tags":"","reserved_b2b":False,"manual_price_X":None,"manual_price_Y":None,"manual_price_Z":None,"listed_X":False,"listed_Y":False,"listed_Z":False},
+            {"id": next_id(), "brand":"Xiaomi","model":"Redmi Note 10","storage":"64GB","color":"Blue","condition":"Usable","stock":0,"base_price":90.0,"tags":"out of stock","reserved_b2b":False,"manual_price_X":None,"manual_price_Y":None,"manual_price_Z":None,"listed_X":False,"listed_Y":False,"listed_Z":False},
+            {"id": next_id(), "brand":"OnePlus","model":"8T","storage":"128GB","color":"Green","condition":"Scrap","stock":2,"base_price":40.0,"tags":"parts only","reserved_b2b":True,"manual_price_X":None,"manual_price_Y":None,"manual_price_Z":None,"listed_X":False,"listed_Y":False,"listed_Z":False},
+        ])
+        st.session_state.inventory = pd.concat([st.session_state.inventory, df_coerce_types(sample)], ignore_index=True)
+        st.success("Sample data added.")
+        log_event("add_sample", {"rows": len(sample)})
+
+# ------------------------------
+# Add / Edit Form
+# ------------------------------
+with st.expander("➕ Add a Phone", expanded=False):
+    fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+    brand = fcol1.text_input("Brand")
+    model = fcol2.text_input("Model")
+    storage = fcol3.text_input("Storage (e.g., 128GB)")
+    color = fcol4.text_input("Color")
+    ccol1, ccol2, ccol3, ccol4 = st.columns(4)
+    condition = ccol1.selectbox("Condition", ALL_INTERNAL_CONDS, index=ALL_INTERNAL_CONDS.index("Good"))
+    stock = ccol2.number_input("Stock", min_value=0, step=1, value=1)
+    base_price = ccol3.number_input("Base Price (desired net)", min_value=0.0, step=1.0, value=100.0)
+    reserved_b2b = ccol4.checkbox("Reserved (B2B/Direct)", value=False)
+    tcol1, tcol2, tcol3, tcol4 = st.columns(4)
+    manual_x = tcol1.number_input("Manual Price X (opt)", min_value=0.0, step=1.0, value=0.0)
+    manual_y = tcol2.number_input("Manual Price Y (opt)", min_value=0.0, step=1.0, value=0.0)
+    manual_z = tcol3.number_input("Manual Price Z (opt)", min_value=0.0, step=1.0, value=0.0)
+    tags = tcol4.text_input("Tags (comma‑sep)")
+    if st.button("Add Phone", type="primary"):
+        if not brand or not model:
+            st.error("Brand and Model are required.")
+        else:
+            rid = next_id()
+            row = {
+                "id": rid,
+                "brand": sanitize_text(brand),
+                "model": sanitize_text(model),
+                "storage": sanitize_text(storage),
+                "color": sanitize_text(color),
+                "condition": sanitize_text(condition),
+                "stock": int(stock),
+                "base_price": float(base_price),
+                "tags": sanitize_text(tags),
+                "reserved_b2b": bool(reserved_b2b),
+                "manual_price_X": float(manual_x) if manual_x > 0 else None,
+                "manual_price_Y": float(manual_y) if manual_y > 0 else None,
+                "manual_price_Z": float(manual_z) if manual_z > 0 else None,
+                "listed_X": False, "listed_Y": False, "listed_Z": False,
+            }
+            st.session_state.inventory = pd.concat([st.session_state.inventory, pd.DataFrame([row])], ignore_index=True)
+            st.success(f"Added {rid}")
+            log_event("add", row)
+
+# ------------------------------
+# Filters
+# ------------------------------
+flt1, flt2, flt3, flt4 = st.columns([2,2,2,2])
+with flt1:
+    q = st.text_input("Search brand/model", value="")
+with flt2:
+    cond_sel = st.multiselect("Filter conditions", ALL_INTERNAL_CONDS, default=[])
+with flt3:
+    platform_filter = st.multiselect("Filter listed on platform", ["X","Y","Z"], default=[])
+with flt4:
+    hide_oos = st.checkbox("Hide out of stock / reserved", value=False)
+
+inv = st.session_state.inventory.copy()
+if q:
+    ql = sanitize_text(q).lower()
+    inv = inv[inv["brand"].str.lower().str.contains(ql) | inv["model"].str.lower().str.contains(ql)]
+if cond_sel:
+    inv = inv[inv["condition"].isin(cond_sel)]
+if platform_filter:
+    for P in platform_filter:
+        inv = inv[inv[f"listed_{P}"] == True]
+if hide_oos:
+    inv = inv[(inv["stock"] > 0) & (~inv["reserved_b2b"]) & (~inv["tags"].str.contains("out of stock", case=False, na=False))]
+
+# Compute prices on the fly for display
+price_cols = {"price_X":[], "price_Y":[], "price_Z":[], "profit_flag_X":[], "profit_flag_Y":[], "profit_flag_Z":[],
+              "cond_X":[], "cond_Y":[], "cond_Z":[]}
+for _, r in inv.iterrows():
+    prices = compute_prices_row(r)
+    for P in ["X","Y","Z"]:
+        price_cols[f"price_{P}"].append(prices[P])
+        price_cols[f"profit_flag_{P}"].append(price_profitability_flag(r.get("base_price"), prices[P]) if prices[P] is not None else True)
+        ok, mapped = condition_supported(P, r.get("condition", ""))
+        price_cols[f"cond_{P}"].append(mapped if ok else "(unsupported)")
+for k,v in price_cols.items():
+    inv[k] = v
+
+st.caption("Prices shown are computed from base price (desired net) and fee models, unless a manual override is present.")
+
+# Display table
+st.dataframe(inv[[
+    "id","brand","model","storage","color","condition","stock","base_price",
+    "price_X","price_Y","price_Z","cond_X","cond_Y","cond_Z",
+    "listed_X","listed_Y","listed_Z","tags","reserved_b2b"
+]].reset_index(drop=True), use_container_width=True, hide_index=True)
+
+# ------------------------------
+# Row Actions (Update / Delete / Listing Simulator)
+# ------------------------------
+with st.expander("✏️ Edit / Delete / List Phones"):
+    if inv.empty:
+        st.info("No matching records.")
+    else:
+        for _, r in inv.iterrows():
+            box = st.container()
+            with box:
+                st.markdown(f"**{r['id']} – {r['brand']} {r['model']} ({r['storage']}, {r['color']})**")
+                e1,e2,e3,e4,e5 = st.columns([2,2,2,2,1])
+                with e1:
+                    new_cond = st.selectbox(f"Condition [{r['id']}]", ALL_INTERNAL_CONDS, index=ALL_INTERNAL_CONDS.index(r['condition']), key=f"cond_{r['id']}")
+                    new_stock = st.number_input(f"Stock [{r['id']}]", min_value=0, step=1, value=int(r['stock']), key=f"stock_{r['id']}")
+                    new_tags = st.text_input(f"Tags [{r['id']}]", value=r['tags'] or "", key=f"tags_{r['id']}")
+                with e2:
+                    new_base = st.number_input(f"Base Price [{r['id']}]", min_value=0.0, step=1.0, value=float(r['base_price'] or 0.0), key=f"base_{r['id']}")
+                    new_res = st.checkbox(f"Reserved B2B [{r['id']}]", value=bool(r['reserved_b2b']), key=f"res_{r['id']}")
+                with e3:
+                    new_mx = st.number_input(f"Manual X [{r['id']}]", min_value=0.0, step=1.0, value=float(r['manual_price_X'] or 0.0), key=f"mx_{r['id']}")
+                    new_my = st.number_input(f"Manual Y [{r['id']}]", min_value=0.0, step=1.0, value=float(r['manual_price_Y'] or 0.0), key=f"my_{r['id']}")
+                    new_mz = st.number_input(f"Manual Z [{r['id']}]", min_value=0.0, step=1.0, value=float(r['manual_price_Z'] or 0.0), key=f"mz_{r['id']}")
+                with e4:
+                    st.write("**Simulate Listing**")
+                    list_x = st.button(f"List on X [{r['id']}]", key=f"listx_{r['id']}")
+                    list_y = st.button(f"List on Y [{r['id']}]", key=f"listy_{r['id']}")
+                    list_z = st.button(f"List on Z [{r['id']}]", key=f"listz_{r['id']}")
+                with e5:
+                    do_save = st.button(f"💾 Save [{r['id']}]", key=f"save_{r['id']}")
+                    do_del = st.button(f"🗑️ Delete [{r['id']}]", key=f"del_{r['id']}")
+
+                # Save
+                if do_save:
+                    idx = st.session_state.inventory.index[st.session_state.inventory["id"]==r['id']][0]
+                    st.session_state.inventory.loc[idx, [
+                        "condition","stock","tags","base_price","reserved_b2b",
+                        "manual_price_X","manual_price_Y","manual_price_Z"
+                    ]] = [
+                        sanitize_text(new_cond), int(new_stock), sanitize_text(new_tags), float(new_base), bool(new_res),
+                        (float(new_mx) if new_mx>0 else None), (float(new_my) if new_my>0 else None), (float(new_mz) if new_mz>0 else None)
+                    ]
+                    st.success(f"Saved {r['id']}")
+                    log_event("update", {"id": r['id']})
+                    st.rerun()
+
+                # Delete
+                if do_del:
+                    st.session_state.inventory = st.session_state.inventory[st.session_state.inventory["id"]!=r['id']].reset_index(drop=True)
+                    st.warning(f"Deleted {r['id']}")
+                    log_event("delete", {"id": r['id']})
+                    st.rerun()
+
+                # Listing simulator helper
+                def try_list(platform: str):
+                    # Eligibility checks
+                    if r['stock'] <= 0:
+                        st.error(f"{r['id']}: Cannot list – out of stock.")
+                        log_event("list_fail", {"id": r['id'], "platform": platform, "reason":"out_of_stock"})
+                        return
+                    if bool(r['reserved_b2b']) or (r['tags'] and 'out of stock' in (r['tags'] or '').lower()):
+                        st.error(f"{r['id']}: Cannot list – reserved/B2B or tagged out of stock.")
+                        log_event("list_fail", {"id": r['id'], "platform": platform, "reason":"reserved_or_tagged"})
+                        return
+                    ok, mapped = condition_supported(platform, r['condition'])
+                    if not ok:
+                        st.error(f"{r['id']}: Condition unsupported on {platform}.")
+                        log_event("list_fail", {"id": r['id'], "platform": platform, "reason":"cond_unsupported"})
+                        return
+                    prices = compute_prices_row(r)
+                    L = prices[platform]
+                    if L is None:
+                        st.error(f"{r['id']}: Price computation failed for {platform}.")
+                        log_event("list_fail", {"id": r['id'], "platform": platform, "reason":"price_compute"})
+                        return
+                    if price_profitability_flag(r['base_price'], L) and st.session_state.settings["block_on_unprofitable"]:
+                        st.error(f"{r['id']}: Listing blocked on {platform} due to high fees / low margin (list {L}).")
+                        log_event("list_fail", {"id": r['id'], "platform": platform, "reason":"unprofitable", "price": L})
+                        return
+                    # Simulate API success
+                    idx = st.session_state.inventory.index[st.session_state.inventory["id"]==r['id']][0]
+                    st.session_state.inventory.loc[idx, f"listed_{platform}"] = True
+                    st.success(f"{r['id']}: Listed on {platform} as '{mapped}' at {L} (mock success).")
+                    log_event("list_ok", {"id": r['id'], "platform": platform, "mapped_cond": mapped, "price": L})
+                    st.rerun()
+
+                if list_x: try_list("X")
+                if list_y: try_list("Y")
+                if list_z: try_list("Z")
+
+# ------------------------------
+# Activity Log
+# ------------------------------
+with st.expander("🧾 Activity Log"):
+    if st.session_state.log:
+        st.dataframe(pd.DataFrame(st.session_state.log), use_container_width=True)
+    else:
+        st.info("No activity yet.")
+
+# ------------------------------
+# Help Panel
+# ------------------------------
+with st.expander("ℹ️ Help / Notes"):
+    st.markdown(
+        """
+        **Fee Models**  
+        - X: 10% fee  
+        - Y: 8% fee + $2  
+        - Z: 12% fee  
+        
+        Listing price is computed so that the **net after fees equals your Base Price**. For percentage fee *f* and flat fee *c*:
+        
+        \\( Listing = (Base + c) / (1-f) \\)
+        
+        **Condition Mapping**  
+        - X: New, Good, Scrap  
+        - Y: 3★ (Excellent), 2★ (Good), 1★ (Usable)  
+        - Z: New, As New, Good  
+        
+        Unsupported mappings (e.g., Scrap on Y/Z) will fail to list.
+        
+        **Profitability Guard**  
+        If the required listing price markup over Base exceeds the configurable threshold, listing can be blocked.
+        
+        **Security**  
+        - Mock login (admin/admin123).  
+        - Basic input sanitization and validation.  
+        - No external integrations; all operations are simulated.
+        
+        **Tips**  
+        - Use *Add Sample Data* to quickly demo flows.  
+        - Try reserving a phone or setting stock to 0 to test safeguards.  
+        - Add manual prices to override auto-computed ones per platform.
+        """
+    )
